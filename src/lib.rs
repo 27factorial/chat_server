@@ -30,8 +30,10 @@ impl Message {
 }
 
 pub struct ConnectionPool {
+    handlers: Vec<Handler>,
     conn_sender: mpsc::Sender<Connection>,
-    handler_thread: thread::JoinHandle<()>,
+    broadcaster: Arc<Mutex<Broadcaster>>,
+    broadcast_thread: thread::JoinHandle<()>,
 }
 
 impl ConnectionPool {
@@ -44,51 +46,59 @@ impl ConnectionPool {
         let (conn_sender, conn_receiver) = mpsc::channel();
         let conn_receiver = Arc::new(Mutex::new(conn_receiver));
 
+        let broadcaster = Arc::new(Mutex::new(Broadcaster::new()));
+
         let mut handlers = Vec::with_capacity(size);
 
         for id in 0..size {
             let conn_receiver = Arc::clone(&conn_receiver);
             let msg_sender = msg_sender.clone();
 
-            let (broadcast_sender, broadcast_receiver) = mpsc::sync_channel(0);
-
-            handlers.push(BroadcastHandler::new(
-                broadcast_sender,
-                Handler::new(id, conn_receiver, msg_sender, Arc::new(Mutex::new(broadcast_receiver))),
-            ));
+            handlers.push(Handler::new(id, conn_receiver, msg_sender));
         }
 
-        let handler_thread = thread::spawn(move || loop {
-            for msg in msg_receiver.recv() {
-                if msg.contents != "" {
-                    println!("{}", msg);
+        let mutex_broadcaster = Arc::clone(&broadcaster);
 
-                    for handler in &handlers {
-                        if let Err(_) = handler.broadcaster.try_send(msg.clone()) {
-                            continue;
-                        }
+        let broadcast_thread = thread::spawn(move || {
+            let broadcaster = mutex_broadcaster;
+
+            loop {
+                for msg in msg_receiver.recv() {
+                    let mut broadcaster = broadcaster.lock().unwrap();
+
+                    if msg.contents != "" {
+                        println!("{}", msg);
+
+                        broadcaster.broadcast(msg);
                     }
                 }
             }
         });
 
         let conn_pool = ConnectionPool {
+            handlers,
             conn_sender,
-            handler_thread,
+            broadcaster,
+            broadcast_thread,
         };
 
         Ok(conn_pool)
     }
 
-    pub fn accept(&self, raw_stream: TcpStream) -> Result<(), Box<dyn Error>> {
+    pub fn accept(&self, raw_stream: TcpStream) -> Result<(), Box<dyn Error + '_>> {
+        let mut broadcaster = self.broadcaster.lock()?;
+
         // TODO: Check this, make sure the connection pool doesn't
         // contain a connection with the same id.
         let id = rand::random::<u64>();
 
-        raw_stream.set_nonblocking(true)?;
+        // raw_stream.set_nonblocking(true)?;
 
         // TODO: Make this duration a config option.
         let timeout = Some(Duration::from_secs(120));
+
+        broadcaster.add(raw_stream.try_clone()?);
+
         let connection = Connection::new(id, raw_stream, timeout)?;
 
         self.conn_sender.send(connection)?;
@@ -129,20 +139,18 @@ impl Handler {
         id: usize,
         conn_receiver: Arc<Mutex<mpsc::Receiver<Connection>>>,
         msg_sender: mpsc::Sender<Message>,
-        msg_receiver: Arc<Mutex<mpsc::Receiver<Message>>>,
     ) -> Handler {
         let thread = thread::spawn(move || loop {
             let mut connection = conn_receiver.lock().unwrap().recv().unwrap();
 
             println!("Handler {} has received connection {}.", id, connection.id);
 
-            Handler::handle_connection(&mut connection, Arc::clone(&msg_receiver), &msg_sender)
-                .unwrap_or_else(|e| {
-                    eprintln!(
-                        "There was an error handling Connection {}: {}",
-                        connection.id, e
-                    );
-                });
+            Handler::handle_connection(&mut connection, &msg_sender).unwrap_or_else(|e| {
+                eprintln!(
+                    "There was an error handling Connection {}: {}",
+                    connection.id, e
+                );
+            });
         });
 
         Handler { id, thread }
@@ -150,45 +158,43 @@ impl Handler {
 
     fn handle_connection(
         connection: &mut Connection,
-        msg_receiver: Arc<Mutex<mpsc::Receiver<Message>>>,
         msg_sender: &mpsc::Sender<Message>,
     ) -> Result<(), Box<dyn Error>> {
-        let mut writer = connection.raw_stream.try_clone()?;
-
-        thread::spawn(move || loop {
-            let msg = msg_receiver.lock().unwrap().recv().unwrap();
-            let msg = msg.to_string();
-
-            writer.write(msg.as_bytes()).unwrap();
-            writer.flush().unwrap();
-        });
-
         loop {
             let mut msg_buffer = [b'\n'; 1024];
-            if let Ok(_) = connection.raw_stream.read(&mut msg_buffer) {
-                let msg_str = String::from(String::from_utf8_lossy(&msg_buffer).trim());
 
-                // This `None` should be replaced with a `to` recipient if there
-                // is one. This will just broadcast for now.
-                let msg = Message::new(msg_str, connection.id, None);
+            connection.raw_stream.read(&mut msg_buffer)?;
 
-                msg_sender.send(msg)?;
-            }
+            let msg_str = String::from(String::from_utf8_lossy(&msg_buffer).trim());
+
+            // This `None` should be replaced with a `to` recipient if there
+            // is one. This will just broadcast for now.
+            let msg = Message::new(msg_str, connection.id, None);
+
+            msg_sender.send(msg)?;
         }
     }
 }
 
-#[derive(Debug)]
-struct BroadcastHandler {
-    broadcaster: mpsc::SyncSender<Message>,
-    handler: Handler,
+struct Broadcaster {
+    streams: Vec<TcpStream>,
 }
 
-impl BroadcastHandler {
-    fn new(broadcaster: mpsc::SyncSender<Message>, handler: Handler) -> BroadcastHandler {
-        BroadcastHandler {
-            broadcaster,
-            handler,
+impl Broadcaster {
+    fn new() -> Broadcaster {
+        Broadcaster { streams: vec![] }
+    }
+
+    fn broadcast(&mut self, msg: Message) {
+        let msg = msg.to_string();
+
+        for stream in &mut self.streams {
+            stream.write(msg.as_bytes()).ok();
+            stream.flush().ok();
         }
+    }
+
+    fn add(&mut self, stream: TcpStream) {
+        self.streams.push(stream);
     }
 }

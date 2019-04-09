@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::process;
 
 fn main() {
-    let size = 20;
+    let size = 100_000;
 
     let conn_pool = match ConnectionPool::new(size) {
         Ok(pool) => {
