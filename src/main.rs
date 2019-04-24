@@ -1,36 +1,17 @@
-use chat_server::ConnectionPool;
+mod server;
 
 use std::net::TcpListener;
+use server::Server;
 use std::process;
 
 fn main() {
-    let size = 100_000;
+    let listener = TcpListener::bind("127.0.0.1:7878").unwrap_or_else(|err| {
+        eprintln!("Could not bind to address! Error: {}", err);
+        process::exit(1);
+    });
 
-    let conn_pool = match ConnectionPool::new(size) {
-        Ok(pool) => {
-            println!("Created connection pool of size {}", size);
-            pool
-        }
-        Err(e) => {
-            eprintln!("Error creating connection pool: {}", e);
-            process::exit(1);
-        }
-    };
-
-    let listener = TcpListener::bind("10.0.0.39:7878").expect("Could not bind to address.");
-    println!("Server started at [{}]", listener.local_addr().unwrap());
-
-    for stream in listener.incoming() {
-        let stream = match stream {
-            Ok(stream) => stream,
-            Err(e) => {
-                eprintln!("Error receiving stream: {}", e);
-                continue;
-            }
-        };
-
-        conn_pool.accept(stream).unwrap_or_else(|e| {
-            eprintln!("Error accepting stream: {}", e);
-        });
-    }
+    let _ = Server::init(10).unwrap_or_else(|err| {
+        eprintln!("Error starting server! Error: {:?}", err);
+        process::exit(2);
+    }).start(listener);
 }
