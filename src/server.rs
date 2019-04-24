@@ -1,7 +1,10 @@
 extern crate hashbrown;
 extern crate rand;
+use crate::command;
 
 use self::ServerError::*;
+
+use command::{Command, CommandHandler};
 
 use hashbrown::HashMap;
 
@@ -19,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-type Id = usize;
-type ServerResult<T> = Result<T, ServerError>;
+pub type Id = usize;
+pub type ServerResult<T> = Result<T, ServerError>;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -46,10 +49,11 @@ pub struct Server {
     msg_sender: Sender<Message>,
     msg_recver: Receiver<Message>,
     handlers: HashMap<Id, Handler>,
+    cmd_handler: CommandHandler,
 }
 
 impl Server {
-    pub fn init(size: usize) -> ServerResult<Server> {
+    pub fn init(size: usize, cmd_prefix: &'static str) -> ServerResult<Server> {
         if size == 0 {
             return Err(InvalidConfig("Server can not have zero connections."));
         }
@@ -58,11 +62,14 @@ impl Server {
 
         let handlers = HashMap::with_capacity(size);
 
+        let cmd_handler = CommandHandler::new(cmd_prefix);
+
         Ok(Server {
             size,
             msg_sender,
             msg_recver,
             handlers,
+            cmd_handler,
         })
     }
 
@@ -72,8 +79,12 @@ impl Server {
     }
 
     #[allow(unused)]
-    pub fn cmd(name: &str) {
-        unimplemented!();
+    pub fn cmd<C: Command + 'static>(mut self, name: &'static str, command: C) -> Self {
+        let command = Box::new(command);
+
+        self.cmd_handler.register(name, command);
+
+        self
     }
 
     pub fn start(mut self, listener: TcpListener) {
@@ -100,7 +111,7 @@ impl Server {
                             .remove(&id)
                             .and_then(|handler| handler.thread.join().ok());
                     });
-                    self.check_and_broadcast();
+                    self.handle_msgs();
                 }
                 Err(_) => {
                     eprintln!("There was an error receiving the connection!");
@@ -142,7 +153,7 @@ impl Server {
         Ok(id)
     }
 
-    fn check_handlers(&mut self) -> Vec<usize> {
+    fn check_handlers(&self) -> Vec<usize> {
         use self::FinishedStatus::*;
         use self::HandlerAsync::*;
 
@@ -180,13 +191,42 @@ impl Server {
         // to_be_removed
     }
 
-    fn check_and_broadcast(&mut self) {
+    fn handle_msgs(&self) {
         if let Ok(msg) = self.msg_recver.try_recv() {
             if msg.contents != "" {
-                let msg_str = msg.to_string();
+                if msg.contents.starts_with(self.cmd_handler.prefix) {
+                    let mut conn = self
+                        .handlers
+                        .get(&msg.from)
+                        .unwrap()
+                        .connection
+                        .lock()
+                        .unwrap();
+
+                    match self.cmd_handler.exec(&msg.contents, &conn) {
+                        Ok(response) => {
+                            conn.write_bytes(response.msg.as_bytes()).unwrap_or_else(|err| {
+                                eprintln!(
+                                    "Could not send message to a Connection! This is most likely a bug. Error: {}",
+                                    err
+                                );
+                            });
+                        },
+                        Err(_) => {
+                            conn.write_bytes(b"Error").unwrap_or_else(|err| {
+                                eprintln!(
+                                    "Could not send message to a Connection! This is most likely a bug. Error: {}",
+                                    err
+                                );
+                            });
+                        }
+                    }
+                }
+
+                let msg_str = format!("{} -> {}", msg.from, msg.to_string());
                 println!("{}", msg_str);
 
-                self.handlers.values_mut().for_each(|handler| {
+                self.handlers.values().for_each(|handler| {
                     let mut conn = handler
                         .connection
                         .lock()
@@ -236,7 +276,6 @@ impl Handler {
     ) {
         use self::FinishedStatus::*;
 
-        let mut terminated = false;
         let mut attempts = 0u128;
         let mut buf = Vec::with_capacity(1024); // Just a default
 
@@ -295,8 +334,8 @@ impl Handler {
     }
 }
 
-struct Connection {
-    id: usize,
+pub struct Connection {
+    pub id: usize,
     stream: TcpStream,
 }
 
@@ -355,7 +394,7 @@ impl Connection {
     }
 }
 
-struct Message {
+pub struct Message {
     contents: String,
     from: Id,
     to: Option<Id>,
@@ -369,11 +408,10 @@ impl Message {
 
 impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} -> {}", self.from, self.contents)
+        write!(f, "{}", self.contents)
     }
 }
 
 fn bytes_to_string(buf: &[u8]) -> String {
-    let s = String::from(String::from_utf8_lossy(buf).trim());
-    s
+    String::from(String::from_utf8_lossy(buf).trim())
 }
