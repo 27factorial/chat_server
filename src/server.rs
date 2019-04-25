@@ -25,6 +25,10 @@ use std::time::Duration;
 pub type Id = usize;
 pub type ServerResult<T> = Result<T, ServerError>;
 
+fn bytes_to_string(buf: &[u8]) -> String {
+    String::from(String::from_utf8_lossy(buf).trim())
+}
+
 #[derive(Debug)]
 pub enum ServerError {
     InvalidConfig(&'static str),
@@ -53,7 +57,7 @@ pub struct Server {
 }
 
 impl Server {
-    pub fn init(size: usize, cmd_prefix: &'static str) -> ServerResult<Server> {
+    pub fn init(size: usize, cmd_prefix: char) -> ServerResult<Server> {
         if size == 0 {
             return Err(InvalidConfig("Server can not have zero connections."));
         }
@@ -78,44 +82,52 @@ impl Server {
         unimplemented!();
     }
 
-    #[allow(unused)]
     pub fn cmd<C: Command + 'static>(mut self, name: &'static str, command: C) -> Self {
         let command = Box::new(command);
-
         self.cmd_handler.register(name, command);
 
         self
     }
 
     pub fn start(mut self, listener: TcpListener) {
-        listener
-            .set_nonblocking(true)
-            .expect("Could not set listener into non-blocking mode!");
+        eprintln!("Setting up listener...");
+        let (conn_sender, conn_recver) = mpsc::channel();
+        let _ = thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(s) => conn_sender.send(s).expect("Connection receiver hung up!"),
+                    Err(_) => {
+                        eprintln!("There was an error receiving the connection!");
+                    }
+                }
+            }
+        });
 
+        // A bit of a hack to work around high CPU usage. This
+        // timeout limits the amount of times per second that
+        // the main loop runs, cutting down on the calls to these
+        // functions significantly. Even with a very tiny timeout,
+        // this makes the application run with very low CPU usage.
+        let timeout = Duration::from_nanos(1000);
         eprintln!("Server started!");
-
-        for stream in listener.incoming() {
-            match stream {
+        loop {
+            match conn_recver.recv_timeout(timeout) {
                 Ok(s) => self
                     .accept(s)
                     .and_then(|id| {
-                        println!("Connection {} accepted!", id);
+                        eprintln!("Connection {} accepted!", id);
                         Ok(())
                     })
-                    .unwrap_or_else(|_err| eprintln!("Error accepting new connection!")),
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // No new connections, so let's check if we need to remove
-                    // any handlers, then check for messages.
-                    self.check_handlers().into_iter().for_each(|id| {
+                    .unwrap_or_else(|e| eprintln!("Error accepting connection! Error: {:?}", e)),
+                Err(e) if e == mpsc::RecvTimeoutError::Timeout => {
+                    self.check_handlers().iter().for_each(|id| {
                         self.handlers
-                            .remove(&id)
+                            .remove(id)
                             .and_then(|handler| handler.thread.join().ok());
                     });
                     self.handle_msgs();
                 }
-                Err(_) => {
-                    eprintln!("There was an error receiving the connection!");
-                }
+                Err(_) => panic!("Connection sender hung up!"),
             }
         }
     }
@@ -184,11 +196,6 @@ impl Server {
             })
             .map(|(&id, _)| id)
             .collect()
-
-        // TODO: Add a message sender to handlers, make them send message when one
-        // is read, then deal with that and broadcast to all connections here.
-
-        // to_be_removed
     }
 
     fn handle_msgs(&self) {
@@ -201,9 +208,9 @@ impl Server {
                         .unwrap()
                         .connection
                         .lock()
-                        .unwrap();
+                        .expect("Another thread panicked while holding a conn lock!");
 
-                    match self.cmd_handler.exec(&msg.contents, &conn) {
+                    match self.cmd_handler.exec(&msg) {
                         Ok(response) => {
                             conn.write_bytes(response.msg.as_bytes()).unwrap_or_else(|err| {
                                 eprintln!(
@@ -211,7 +218,7 @@ impl Server {
                                     err
                                 );
                             });
-                        },
+                        }
                         Err(_) => {
                             conn.write_bytes(b"Error").unwrap_or_else(|err| {
                                 eprintln!(
@@ -221,24 +228,24 @@ impl Server {
                             });
                         }
                     }
-                }
+                } else {
+                    let msg_str = format!("{} -> {}", msg.from, msg.to_string());
+                    println!("{}", msg_str);
 
-                let msg_str = format!("{} -> {}", msg.from, msg.to_string());
-                println!("{}", msg_str);
+                    self.handlers.values().for_each(|handler| {
+                        let mut conn = handler
+                            .connection
+                            .lock()
+                            .expect("Another thread panicked while holding a conn lock!");
 
-                self.handlers.values().for_each(|handler| {
-                    let mut conn = handler
-                        .connection
-                        .lock()
-                        .expect("Another thread panicked while holding a conn lock!");
-
-                    conn.write_bytes(msg_str.as_bytes()).unwrap_or_else(|err| {
-                        eprintln!(
-                            "Could not send message to a Connection! This is most likely a bug. Error: {}",
-                            err
-                        );
+                        conn.write_bytes(msg_str.as_bytes()).unwrap_or_else(|err| {
+                            eprintln!(
+                                "Could not send message to a Connection! This is most likely a bug. Error: {}",
+                                err
+                            );
+                        });
                     });
-                });
+                }
             }
         }
     }
@@ -395,9 +402,9 @@ impl Connection {
 }
 
 pub struct Message {
-    contents: String,
-    from: Id,
-    to: Option<Id>,
+    pub contents: String,
+    pub from: Id,
+    pub to: Option<Id>,
 }
 
 impl Message {
@@ -410,8 +417,4 @@ impl fmt::Display for Message {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{}", self.contents)
     }
-}
-
-fn bytes_to_string(buf: &[u8]) -> String {
-    String::from(String::from_utf8_lossy(buf).trim())
 }

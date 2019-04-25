@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 extern crate hashbrown;
 use crate::server;
 
@@ -9,6 +11,52 @@ use server::Connection;
 use server::Id;
 use server::Message;
 
+#[macro_export]
+macro_rules! command {
+    ($f:ident() $b:block) => {
+        #[allow(non_camel_case_types)]
+        struct $f;
+
+        impl crate::command::Command for $f {
+            fn execute(
+                &self,
+                _: &crate::server::Message,
+                _: crate::command::Args,
+            ) -> crate::command::CmdResponse {
+                crate::command::CmdResponse::from_tuple($b)
+            }
+        }
+    };
+    ($f:ident($m:ident) $b:block) => {
+        #[allow(non_camel_case_types)]
+        struct $f;
+
+        impl crate::command::Command for $f {
+            fn execute(
+                &self,
+                $m: &crate::server::Message,
+                _: crate::command::Args,
+            ) -> crate::command::CmdResponse {
+                crate::command::CmdResponse::from_tuple($b)
+            }
+        }
+    };
+    ($f:ident($m:ident, $a:ident) $b:block) => {
+        #[allow(non_camel_case_types)]
+        struct $f;
+
+        impl crate::command::Command for $f {
+            fn execute(
+                &self,
+                $m: &crate::server::Message,
+                $a: crate::command::Args,
+            ) -> crate::command::CmdResponse {
+                crate::command::CmdResponse::from_tuple($b)
+            }
+        }
+    };
+}
+
 type CmdResult<T> = Result<T, CommandError>;
 
 pub enum CommandError {
@@ -16,33 +64,41 @@ pub enum CommandError {
 }
 
 pub trait Command {
-    fn execute(&self, from: &Connection, _: Args) -> CmdResponse;
+    fn execute(&self, _: &Message, _: Args) -> CmdResponse;
 }
 
 pub struct CommandHandler {
-    pub prefix: &'static str,
+    pub prefix: char,
     commands: HashMap<&'static str, Box<dyn Command>>,
 }
 
 impl CommandHandler {
-    pub fn new(prefix: &'static str) -> CommandHandler {
+    pub fn new(prefix: char) -> CommandHandler {
         let commands = HashMap::new();
 
         CommandHandler { prefix, commands }
+    }
+
+    fn cmd_from_message(message: &Message) -> String {
+        message
+            .contents
+            .chars()
+            .skip(1)
+            .take_while(|&c| c != ' ')
+            .collect::<String>()
     }
 
     pub fn register(&mut self, name: &'static str, command: Box<dyn Command>) {
         self.commands.insert(name, command);
     }
 
-    pub fn exec(&self, msg: &str, connection: &Connection) -> CmdResult<CmdResponse> {
-        let name = msg.chars().skip(1).collect::<String>();
-        let name = name.as_str();
+    pub fn exec(&self, msg: &Message) -> CmdResult<CmdResponse> {
+        let name = Self::cmd_from_message(msg);
 
         let args = Args::new(msg);
 
-        match self.commands.get(name) {
-            Some(cmd) => Ok(cmd.execute(connection, args)),
+        match self.commands.get(name.as_str()) {
+            Some(cmd) => Ok(cmd.execute(msg, args)),
             None => Err(NoSuchCommand),
         }
     }
@@ -54,19 +110,33 @@ pub struct CmdResponse {
 }
 
 impl CmdResponse {
+    #[allow(unused)]
     pub fn new(to: Id, msg: String) -> CmdResponse {
+        CmdResponse { to, msg }
+    }
+
+    pub fn from_tuple((to, msg): (Id, String)) -> CmdResponse {
         CmdResponse { to, msg }
     }
 }
 
 pub struct Args<'a> {
+    pub count: usize,
     args: Vec<&'a str>,
 }
 
 impl<'a> Args<'a> {
-    fn new(message: &'a str) -> Args<'a> {
-        let args = message.split_whitespace().skip(1).collect();
+    fn new(msg: &Message) -> Args<'_> {
+        let args: Vec<&'_ str> = msg.contents.split_ascii_whitespace().skip(1).collect();
+        let count = args.len();
 
-        Args { args }
+        Args { count, args }
+    }
+
+    pub fn get(&self, i: usize) -> Option<&str> {
+        match self.args.get(i) {
+            Some(s) => Some(*s),
+            None => None
+        }
     }
 }
